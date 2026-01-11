@@ -104,9 +104,9 @@ class RateLimiter {
 // General API rate limiter: 100 requests per minute
 export const apiRateLimiter = new RateLimiter(60000, 100, false);
 
-// Strict rate limiter for email operations: 30 requests per minute
-// notifyEmailService=true to propagate back-pressure to IMAP queue
-export const emailRateLimiter = new RateLimiter(60000, 30, true);
+// Rate limiter for email operations: DISABLED (using high limit)
+// Connection pooling + coalescing + caching now protects Gmail
+export const emailRateLimiter = new RateLimiter(60000, 100000, false);
 
 // Very strict rate limiter for auth: 10 requests per minute
 export const authRateLimiter = new RateLimiter(60000, 10, false);

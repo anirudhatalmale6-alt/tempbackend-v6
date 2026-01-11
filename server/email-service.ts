@@ -10,8 +10,8 @@ const imapConfig = {
   tls: true,
   tlsOptions: { rejectUnauthorized: false },
   keepalive: true,
-  authTimeout: 10000,
-  connTimeout: 15000,
+  authTimeout: 30000,
+  connTimeout: 30000,
 };
 
 interface FetchedEmail {
@@ -38,7 +38,7 @@ interface CachedEmailData {
   cachedAt: number;
 }
 
-// LRU Cache implementation with bounded size and TTL
+// LRU Cache
 class LRUCache<K, V> {
   private cache: Map<K, { value: V; timestamp: number }>;
   private maxSize: number;
@@ -53,12 +53,10 @@ class LRUCache<K, V> {
   get(key: K): V | undefined {
     const entry = this.cache.get(key);
     if (!entry) return undefined;
-
     if (Date.now() - entry.timestamp > this.ttl) {
       this.cache.delete(key);
       return undefined;
     }
-
     this.cache.delete(key);
     this.cache.set(key, entry);
     return entry.value;
@@ -83,581 +81,363 @@ class LRUCache<K, V> {
   clear(): void {
     this.cache.clear();
   }
-
-  has(key: K): boolean {
-    const entry = this.cache.get(key);
-    if (!entry) return false;
-    if (Date.now() - entry.timestamp > this.ttl) {
-      this.cache.delete(key);
-      return false;
-    }
-    return true;
-  }
-
-  size(): number {
-    return this.cache.size;
-  }
 }
 
-// Bounded caches optimized for high traffic (memory-safe limits)
-const emailCache = new LRUCache<string, FetchedEmail[]>(200, 30000); // 200 address caches, 30s TTL for high traffic
-const emailDataCache = new LRUCache<string, CachedEmailData>(200, 180000); // 200 emails, 3min TTL (memory-safe for attachments)
+// Short cache TTL for fast email updates
+const emailCache = new LRUCache<string, FetchedEmail[]>(500, 10000); // 10 seconds TTL
+const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10 minutes TTL
 
-// Enhanced Request Queue with exponential back-off and rate limit awareness
-interface QueuedRequest<T> {
-  resolve: (value: T) => void;
-  reject: (error: Error) => void;
-  execute: () => Promise<T>;
-  retryCount: number;
-  addedAt: number;
-}
+// ============================================
+// SINGLE SHARED IMAP CONNECTION
+// ============================================
+let sharedConnection: Imap | null = null;
+let connectionState: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
+let connectionPromise: Promise<Imap> | null = null;
+let lastFetchTime = 0;
+let allEmailsCache: FetchedEmail[] = [];
+let allEmailsCacheTime = 0;
+const ALL_EMAILS_CACHE_TTL = 10000; // 10 seconds for all emails cache (fast updates)
 
-class RequestQueue {
-  private queue: QueuedRequest<any>[] = [];
-  private activeConnections = 0;
-  private maxConnections: number;
-  private requestsPerSecond: number;
-  private requestTimestamps: number[] = [];
-  private rateLimitedUntil: number = 0;
-  private consecutiveFailures: number = 0;
-  private maxRetries: number = 3;
-  private baseBackoffMs: number = 1000;
-  private maxBackoffMs: number = 30000;
+// Request coalescing
+const pendingRequests = new Map<string, Promise<FetchedEmail[]>>();
 
-  constructor(maxConnections: number = 3, requestsPerSecond: number = 5) {
-    this.maxConnections = maxConnections;
-    this.requestsPerSecond = requestsPerSecond;
+async function getSharedConnection(): Promise<Imap> {
+  // If already connected, return
+  if (sharedConnection && connectionState === 'connected') {
+    return sharedConnection;
   }
 
-  async enqueue<T>(execute: () => Promise<T>): Promise<T> {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ resolve, reject, execute, retryCount: 0, addedAt: Date.now() });
-      this.processQueue();
+  // If connecting, wait for it
+  if (connectionState === 'connecting' && connectionPromise) {
+    return connectionPromise;
+  }
+
+  // Create new connection
+  connectionState = 'connecting';
+  connectionPromise = new Promise((resolve, reject) => {
+    console.log("Creating shared IMAP connection...");
+    const conn = new Imap(imapConfig);
+
+    const timeout = setTimeout(() => {
+      connectionState = 'error';
+      try { conn.end(); } catch (e) {}
+      reject(new Error("Connection timeout"));
+    }, 30000);
+
+    conn.once("ready", () => {
+      clearTimeout(timeout);
+      console.log("Shared IMAP connection established");
+      sharedConnection = conn;
+      connectionState = 'connected';
+
+      // Open inbox and keep it open
+      conn.openBox("INBOX", false, (err) => {
+        if (err) {
+          console.error("Error opening INBOX:", err);
+          connectionState = 'error';
+          reject(err);
+          return;
+        }
+        resolve(conn);
+      });
     });
-  }
 
-  // Called when API returns 429 with retryAfter
-  setRateLimited(retryAfterSeconds: number): void {
-    this.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
-    console.log(`Rate limited for ${retryAfterSeconds}s, will resume at ${new Date(this.rateLimitedUntil).toISOString()}`);
-  }
+    conn.once("error", (err: Error) => {
+      clearTimeout(timeout);
+      console.error("Shared IMAP connection error:", err.message);
+      connectionState = 'error';
+      sharedConnection = null;
+      reject(err);
+    });
 
-  private isRateLimited(): boolean {
-    const now = Date.now();
+    conn.once("end", () => {
+      console.log("Shared IMAP connection ended");
+      connectionState = 'disconnected';
+      sharedConnection = null;
+      connectionPromise = null;
+    });
 
-    // Check if we're in a rate-limit cooldown period
-    if (now < this.rateLimitedUntil) {
-      return true;
-    }
-
-    // Check requests per second limit
-    this.requestTimestamps = this.requestTimestamps.filter(t => now - t < 1000);
-    return this.requestTimestamps.length >= this.requestsPerSecond;
-  }
-
-  private getBackoffDelay(): number {
-    if (this.consecutiveFailures === 0) return 0;
-    const delay = Math.min(
-      this.baseBackoffMs * Math.pow(2, this.consecutiveFailures - 1),
-      this.maxBackoffMs
-    );
-    // Add jitter (±25%)
-    return delay * (0.75 + Math.random() * 0.5);
-  }
-
-  private async processQueue(): Promise<void> {
-    if (this.queue.length === 0) return;
-    if (this.activeConnections >= this.maxConnections) return;
-
-    const now = Date.now();
-
-    // Check rate limit cooldown
-    if (now < this.rateLimitedUntil) {
-      const waitTime = this.rateLimitedUntil - now;
-      setTimeout(() => this.processQueue(), Math.min(waitTime + 100, 5000));
-      return;
-    }
-
-    if (this.isRateLimited()) {
-      setTimeout(() => this.processQueue(), 200);
-      return;
-    }
-
-    // Apply exponential back-off if we've had failures
-    const backoffDelay = this.getBackoffDelay();
-    if (backoffDelay > 0) {
+    conn.once("close", () => {
+      console.log("Shared IMAP connection closed");
+      connectionState = 'disconnected';
+      sharedConnection = null;
+      connectionPromise = null;
+      // Reconnect after delay
       setTimeout(() => {
-        this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1);
-        this.processQueue();
-      }, backoffDelay);
-      return;
-    }
-
-    const request = this.queue.shift();
-    if (!request) return;
-
-    this.activeConnections++;
-    this.requestTimestamps.push(Date.now());
-
-    try {
-      const result = await request.execute();
-      this.consecutiveFailures = 0; // Reset on success
-      request.resolve(result);
-    } catch (error) {
-      this.consecutiveFailures++;
-
-      // Retry with exponential back-off
-      if (request.retryCount < this.maxRetries) {
-        request.retryCount++;
-        console.log(`Request failed, retry ${request.retryCount}/${this.maxRetries} after backoff`);
-        this.queue.unshift(request); // Re-add to front of queue
-      } else {
-        console.error(`Request failed after ${this.maxRetries} retries`);
-        request.reject(error as Error);
-      }
-    } finally {
-      this.activeConnections--;
-      // Small delay before processing next to prevent burst
-      setTimeout(() => this.processQueue(), 100);
-    }
-  }
-
-  getStats() {
-    return {
-      queueLength: this.queue.length,
-      activeConnections: this.activeConnections,
-      maxConnections: this.maxConnections,
-      consecutiveFailures: this.consecutiveFailures,
-      rateLimitedUntil: this.rateLimitedUntil > Date.now() ? this.rateLimitedUntil : null,
-    };
-  }
-
-  // Graceful shutdown - reject all pending requests
-  shutdown(): void {
-    const pendingRequests = this.queue.splice(0);
-    pendingRequests.forEach(req => {
-      req.reject(new Error("Queue shutdown"));
+        if (connectionState === 'disconnected') {
+          getSharedConnection().catch(() => {});
+        }
+      }, 5000);
     });
-  }
+
+    conn.connect();
+  });
+
+  return connectionPromise;
 }
 
-const requestQueue = new RequestQueue(3, 5); // Max 3 concurrent connections, 5 req/sec
+// ============================================
+// FETCH ALL EMAILS ONCE, FILTER IN MEMORY
+// ============================================
+async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
+  const now = Date.now();
 
-// Export for rate limiter to call when 429 is returned
-export function setRateLimited(retryAfterSeconds: number): void {
-  requestQueue.setRateLimited(retryAfterSeconds);
-}
-
-// Persistent IMAP connection for IDLE mode with enhanced reconnection
-let persistentImap: Imap | null = null;
-let idleTimeout: NodeJS.Timeout | null = null;
-let isIdleActive = false;
-let reconnectAttempts = 0;
-const maxReconnectAttempts = 10;
-const baseReconnectDelay = 1000;
-const maxReconnectDelay = 60000;
-const emailUpdateCallbacks: Set<() => void> = new Set();
-
-// Debounce for IDLE notifications to prevent burst
-let idleNotificationTimeout: NodeJS.Timeout | null = null;
-const IDLE_DEBOUNCE_MS = 2000;
-
-function createImapConnection(): Imap {
-  return new Imap(imapConfig);
-}
-
-function getReconnectDelay(): number {
-  const delay = Math.min(
-    baseReconnectDelay * Math.pow(2, reconnectAttempts),
-    maxReconnectDelay
-  );
-  // Add jitter (±25%)
-  return delay * (0.75 + Math.random() * 0.5);
-}
-
-// Initialize persistent connection with IDLE support and exponential back-off
-export function initPersistentConnection(): void {
-  if (!imapConfig.user || !imapConfig.password) {
-    console.log("Email credentials not configured, skipping persistent connection");
-    return;
+  // Return cached if fresh
+  if (allEmailsCache.length > 0 && (now - allEmailsCacheTime) < ALL_EMAILS_CACHE_TTL) {
+    console.log("Using all-emails cache");
+    return allEmailsCache;
   }
 
-  if (persistentImap) {
-    try {
-      persistentImap.end();
-    } catch (e) {}
+  // Rate limit: minimum 2 seconds between fetches (allows fast updates)
+  if (now - lastFetchTime < 2000) {
+    console.log("Rate limiting fetch, using cache");
+    return allEmailsCache;
   }
 
-  persistentImap = createImapConnection();
-
-  persistentImap.once("ready", () => {
-    console.log("Persistent IMAP connection established");
-    reconnectAttempts = 0; // Reset on successful connection
-    persistentImap!.openBox("INBOX", false, (err) => {
-      if (err) {
-        console.error("Error opening INBOX for IDLE:", err);
-        scheduleReconnect();
-        return;
-      }
-      startIdle();
-    });
-  });
-
-  persistentImap.on("mail", () => {
-    console.log("New email notification via IDLE");
-    // Debounce to prevent burst of notifications
-    if (idleNotificationTimeout) {
-      clearTimeout(idleNotificationTimeout);
-    }
-    idleNotificationTimeout = setTimeout(() => {
-      clearCache();
-      notifyEmailUpdate();
-    }, IDLE_DEBOUNCE_MS);
-  });
-
-  persistentImap.on("expunge", () => {
-    console.log("Email deleted notification via IDLE");
-    // Debounce to prevent burst
-    if (idleNotificationTimeout) {
-      clearTimeout(idleNotificationTimeout);
-    }
-    idleNotificationTimeout = setTimeout(() => {
-      clearCache();
-      notifyEmailUpdate();
-    }, IDLE_DEBOUNCE_MS);
-  });
-
-  persistentImap.once("error", (err: Error) => {
-    console.error("Persistent IMAP error:", err.message);
-    isIdleActive = false;
-    scheduleReconnect();
-  });
-
-  persistentImap.once("end", () => {
-    console.log("Persistent IMAP connection ended");
-    isIdleActive = false;
-    scheduleReconnect();
-  });
-
-  persistentImap.connect();
-}
-
-function scheduleReconnect(): void {
-  if (reconnectAttempts >= maxReconnectAttempts) {
-    console.error(`Max reconnect attempts (${maxReconnectAttempts}) reached. Giving up.`);
-    // Reset after a longer delay to try again later
-    setTimeout(() => {
-      reconnectAttempts = 0;
-      initPersistentConnection();
-    }, 5 * 60 * 1000); // 5 minutes
-    return;
-  }
-
-  reconnectAttempts++;
-  const delay = getReconnectDelay();
-  console.log(`Scheduling IMAP reconnect attempt ${reconnectAttempts}/${maxReconnectAttempts} in ${Math.round(delay)}ms`);
-  setTimeout(initPersistentConnection, delay);
-}
-
-function startIdle(): void {
-  if (!persistentImap || isIdleActive) return;
+  lastFetchTime = now;
 
   try {
-    isIdleActive = true;
-
-    if (idleTimeout) clearTimeout(idleTimeout);
-    idleTimeout = setTimeout(() => {
-      if (persistentImap && isIdleActive) {
-        isIdleActive = false;
-        persistentImap.openBox("INBOX", false, () => {
-          startIdle();
-        });
-      }
-    }, 25 * 60 * 1000);
-
-    console.log("IDLE mode started - listening for new emails");
+    const conn = await getSharedConnection();
+    const emails = await doFetchAllEmails(conn);
+    allEmailsCache = emails;
+    allEmailsCacheTime = Date.now();
+    return emails;
   } catch (err) {
-    console.error("Error starting IDLE:", err);
-    isIdleActive = false;
+    console.error("Error fetching emails:", err);
+    // Return stale cache on error
+    return allEmailsCache;
   }
 }
 
-function notifyEmailUpdate(): void {
-  emailUpdateCallbacks.forEach(callback => {
-    try {
-      callback();
-    } catch (e) {}
-  });
-}
+function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
+  return new Promise((resolve) => {
+    const emails: FetchedEmail[] = [];
 
-export function onEmailUpdate(callback: () => void): () => void {
-  emailUpdateCallbacks.add(callback);
-  return () => emailUpdateCallbacks.delete(callback);
-}
-
-// Fetch emails with request queue, caching, and retry logic
-export async function fetchEmails(targetAddress?: string): Promise<FetchedEmail[]> {
-  const cacheKey = targetAddress || "all";
-
-  // Check cache first
-  const cached = emailCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  // Use request queue to limit concurrent connections
-  return requestQueue.enqueue(async () => {
-    // Double-check cache after getting queue slot
-    const cachedAgain = emailCache.get(cacheKey);
-    if (cachedAgain) return cachedAgain;
-
-    return new Promise<FetchedEmail[]>((resolve, reject) => {
-      if (!imapConfig.user || !imapConfig.password) {
-        console.log("Email credentials not configured, returning empty inbox");
+    // Re-open box to refresh
+    conn.openBox("INBOX", false, (err, box) => {
+      if (err) {
+        console.error("Error opening INBOX for fetch:", err);
         resolve([]);
         return;
       }
 
-      const imap = createImapConnection();
-      const emails: FetchedEmail[] = [];
-      let connectionTimeout: NodeJS.Timeout | null = null;
-      let resolved = false;
+      if (!box || !box.messages.total) {
+        resolve([]);
+        return;
+      }
 
-      const cleanup = () => {
-        if (connectionTimeout) {
-          clearTimeout(connectionTimeout);
-          connectionTimeout = null;
+      // Fetch ALL emails (last 100 for performance)
+      conn.search(["ALL"], (searchErr, results) => {
+        if (searchErr || !results.length) {
+          resolve([]);
+          return;
         }
-        try { imap.end(); } catch (e) {}
-      };
 
-      const safeResolve = (result: FetchedEmail[]) => {
-        if (resolved) return;
-        resolved = true;
-        cleanup();
-        resolve(result);
-      };
+        const recentResults = results.slice(-100);
+        const fetch = conn.fetch(recentResults, {
+          bodies: "",
+          struct: true,
+        });
 
-      const safeReject = (error: Error) => {
-        if (resolved) return;
-        resolved = true;
-        cleanup();
-        reject(error);
-      };
+        let pending = recentResults.length;
+        let resolved = false;
 
-      // Increased timeout with proper cleanup
-      connectionTimeout = setTimeout(() => {
-        console.log("IMAP connection timeout, using cache");
-        safeResolve([]);
-      }, 15000);
-
-      imap.once("ready", () => {
-        if (connectionTimeout) clearTimeout(connectionTimeout);
-
-        imap.openBox("INBOX", false, (err, box) => {
-          if (err) {
-            safeReject(err);
-            return;
+        const timeout = setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            console.log("Fetch timeout, returning partial results");
+            resolve(emails);
           }
+        }, 60000); // 60 second timeout for fetch
 
-          if (!box.messages.total) {
-            emailCache.set(cacheKey, []);
-            safeResolve([]);
-            return;
-          }
+        fetch.on("message", (msg, seqno) => {
+          let buffer = "";
+          let uid = seqno;
 
-          const searchCriteria = targetAddress
-            ? [["TO", targetAddress]]
-            : ["ALL"];
+          msg.on("attributes", (attrs) => {
+            uid = attrs.uid || seqno;
+          });
 
-          imap.search(searchCriteria as any, (searchErr, results) => {
-            if (searchErr) {
-              safeReject(searchErr);
-              return;
-            }
-
-            if (!results.length) {
-              emailCache.set(cacheKey, []);
-              safeResolve([]);
-              return;
-            }
-
-            // Fetch last 50 emails (most recent)
-            const recentResults = results.slice(-50);
-            const fetch = imap.fetch(recentResults, {
-              bodies: "",
-              struct: true,
-            });
-            let pending = recentResults.length;
-
-            fetch.on("message", (msg, seqno) => {
-              let buffer = "";
-              let uid = seqno;
-
-              msg.on("attributes", (attrs) => {
-                uid = attrs.uid || seqno;
-              });
-
-              msg.on("body", (stream) => {
-                stream.on("data", (chunk) => {
-                  buffer += chunk.toString("utf8");
-                });
-              });
-
-              msg.once("end", async () => {
-                try {
-                  const parsed: ParsedMail = await simpleParser(buffer);
-
-                  const fromAddress = parsed.from?.value?.[0]?.address || "unknown@unknown.com";
-                  const fromName = parsed.from?.value?.[0]?.name || "";
-                  const toAddress: string = (Array.isArray(parsed.to)
-                    ? parsed.to[0]?.value?.[0]?.address
-                    : parsed.to?.value?.[0]?.address) || "";
-
-                  if (targetAddress && toAddress.toLowerCase() !== targetAddress.toLowerCase()) {
-                    pending--;
-                    if (pending === 0) {
-                      emailCache.set(cacheKey, emails);
-                      safeResolve(emails);
-                    }
-                    return;
-                  }
-
-                  const emailId = parsed.messageId || `uid-${uid}`;
-
-                  const email: FetchedEmail = {
-                    id: emailId,
-                    uid: uid,
-                    from: fromAddress,
-                    fromName: fromName,
-                    to: toAddress,
-                    subject: parsed.subject || "(No subject)",
-                    date: parsed.date?.toISOString() || new Date().toISOString(),
-                    textContent: parsed.text || "",
-                    htmlContent: parsed.html || undefined,
-                    isRead: false,
-                    attachments: parsed.attachments?.map((att: Attachment) => ({
-                      filename: att.filename || "attachment",
-                      contentType: att.contentType,
-                      size: att.size,
-                    })),
-                  };
-
-                  emailDataCache.set(emailId, {
-                    email,
-                    rawAttachments: parsed.attachments,
-                    cachedAt: Date.now(),
-                  });
-
-                  emails.push(email);
-                } catch (parseErr) {
-                  console.error("Error parsing email:", parseErr);
-                }
-
-                pending--;
-                if (pending === 0) {
-                  emails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-                  emailCache.set(cacheKey, emails);
-                  safeResolve(emails);
-                }
-              });
-            });
-
-            fetch.once("error", (fetchErr) => {
-              safeReject(fetchErr);
-            });
-
-            fetch.once("end", () => {
-              if (pending === 0) {
-                emailCache.set(cacheKey, emails);
-                safeResolve(emails);
-              }
+          msg.on("body", (stream) => {
+            stream.on("data", (chunk) => {
+              buffer += chunk.toString("utf8");
             });
           });
+
+          msg.once("end", async () => {
+            try {
+              const parsed: ParsedMail = await simpleParser(buffer);
+
+              const fromAddress = parsed.from?.value?.[0]?.address || "unknown@unknown.com";
+              const fromName = parsed.from?.value?.[0]?.name || "";
+              const toAddress: string = (Array.isArray(parsed.to)
+                ? parsed.to[0]?.value?.[0]?.address
+                : parsed.to?.value?.[0]?.address) || "";
+
+              const emailId = parsed.messageId || `uid-${uid}`;
+
+              const email: FetchedEmail = {
+                id: emailId,
+                uid: uid,
+                from: fromAddress,
+                fromName: fromName,
+                to: toAddress,
+                subject: parsed.subject || "(No subject)",
+                date: parsed.date?.toISOString() || new Date().toISOString(),
+                textContent: parsed.text || "",
+                htmlContent: parsed.html || undefined,
+                isRead: false,
+                attachments: parsed.attachments?.map((att: Attachment) => ({
+                  filename: att.filename || "attachment",
+                  contentType: att.contentType,
+                  size: att.size,
+                })),
+              };
+
+              emailDataCache.set(emailId, {
+                email,
+                rawAttachments: parsed.attachments,
+                cachedAt: Date.now(),
+              });
+
+              emails.push(email);
+            } catch (parseErr) {
+              console.error("Error parsing email:", parseErr);
+            }
+
+            pending--;
+            if (pending === 0 && !resolved) {
+              resolved = true;
+              clearTimeout(timeout);
+              emails.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+              console.log(`Fetched ${emails.length} emails`);
+              resolve(emails);
+            }
+          });
+        });
+
+        fetch.once("error", (fetchErr) => {
+          console.error("Fetch error:", fetchErr);
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            resolve(emails);
+          }
+        });
+
+        fetch.once("end", () => {
+          if (pending === 0 && !resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            resolve(emails);
+          }
         });
       });
-
-      imap.once("error", (imapErr: Error) => {
-        console.error("IMAP connection error:", imapErr.message);
-        safeResolve([]); // Return empty rather than rejecting for graceful degradation
-      });
-
-      imap.once("end", () => {});
-
-      imap.connect();
     });
   });
+}
+
+// ============================================
+// PUBLIC API
+// ============================================
+export async function fetchEmails(targetAddress?: string): Promise<FetchedEmail[]> {
+  const cacheKey = targetAddress || "all";
+
+  // Check specific address cache first
+  const cached = emailCache.get(cacheKey);
+  if (cached) {
+    console.log(`Cache hit for ${cacheKey}`);
+    return cached;
+  }
+
+  // Coalesce requests
+  if (pendingRequests.has(cacheKey)) {
+    console.log(`Coalescing request for ${cacheKey}`);
+    return pendingRequests.get(cacheKey)!;
+  }
+
+  const fetchPromise = (async () => {
+    try {
+      // Fetch all emails once
+      const allEmails = await fetchAllEmailsOnce();
+
+      // Filter in memory
+      let result: FetchedEmail[];
+      if (targetAddress) {
+        result = allEmails.filter(e =>
+          e.to.toLowerCase() === targetAddress.toLowerCase()
+        );
+      } else {
+        result = allEmails;
+      }
+
+      // Cache the filtered result
+      emailCache.set(cacheKey, result);
+      return result;
+    } finally {
+      pendingRequests.delete(cacheKey);
+    }
+  })();
+
+  pendingRequests.set(cacheKey, fetchPromise);
+  return fetchPromise;
 }
 
 export async function deleteEmail(emailId: string): Promise<boolean> {
   const cachedData = emailDataCache.get(emailId);
 
-  return requestQueue.enqueue(async () => {
-    return new Promise<boolean>((resolve, reject) => {
-      if (!imapConfig.user || !imapConfig.password) {
-        resolve(false);
-        return;
-      }
+  try {
+    const conn = await getSharedConnection();
 
-      const imap = createImapConnection();
-      let resolved = false;
+    return new Promise<boolean>((resolve) => {
+      conn.openBox("INBOX", false, (err) => {
+        if (err) {
+          resolve(false);
+          return;
+        }
 
-      const safeResolve = (result: boolean) => {
-        if (resolved) return;
-        resolved = true;
-        try { imap.end(); } catch (e) {}
-        resolve(result);
-      };
+        const searchCriteria = cachedData?.email?.uid
+          ? [["UID", cachedData.email.uid]]
+          : [["HEADER", "MESSAGE-ID", emailId]];
 
-      imap.once("ready", () => {
-        imap.openBox("INBOX", false, (err) => {
-          if (err) {
-            safeResolve(false);
+        conn.search(searchCriteria as any, (searchErr, results) => {
+          if (searchErr || !results.length) {
+            resolve(false);
             return;
           }
 
-          const searchCriteria = cachedData?.email?.uid
-            ? [[`UID`, cachedData.email.uid]]
-            : [["HEADER", "MESSAGE-ID", emailId]];
-
-          imap.search(searchCriteria as any, (searchErr, results) => {
-            if (searchErr || !results.length) {
-              safeResolve(false);
+          conn.addFlags(results, "\\Deleted", (flagErr) => {
+            if (flagErr) {
+              resolve(false);
               return;
             }
 
-            imap.addFlags(results, "\\Deleted", (flagErr) => {
-              if (flagErr) {
-                safeResolve(false);
-                return;
+            conn.expunge((expErr) => {
+              if (expErr) {
+                resolve(false);
+              } else {
+                // Clear caches
+                emailCache.clear();
+                emailDataCache.delete(emailId);
+                allEmailsCache = [];
+                allEmailsCacheTime = 0;
+                resolve(true);
               }
-
-              imap.expunge((expErr) => {
-                if (expErr) {
-                  safeResolve(false);
-                } else {
-                  emailCache.clear();
-                  emailDataCache.delete(emailId);
-                  safeResolve(true);
-                }
-              });
             });
           });
         });
       });
-
-      imap.once("error", (imapErr: Error) => {
-        console.error("IMAP delete error:", imapErr.message);
-        safeResolve(false);
-      });
-
-      imap.connect();
     });
-  });
+  } catch (err) {
+    console.error("Delete error:", err);
+    return false;
+  }
 }
 
 export function clearCache(): void {
   emailCache.clear();
+  allEmailsCache = [];
+  allEmailsCacheTime = 0;
 }
 
 interface AttachmentData {
@@ -684,132 +464,208 @@ export async function getAttachment(emailId: string, filename: string): Promise<
     }
   }
 
-  return requestQueue.enqueue(async () => {
+  // Fetch from IMAP if not in cache
+  try {
+    const conn = await getSharedConnection();
+
     return new Promise<AttachmentData | null>((resolve) => {
-      if (!imapConfig.user || !imapConfig.password) {
-        resolve(null);
-        return;
-      }
+      conn.openBox("INBOX", false, (err) => {
+        if (err) {
+          resolve(null);
+          return;
+        }
 
-      const imap = createImapConnection();
-      let resolved = false;
+        const searchCriteria = cachedData?.email?.uid
+          ? [["UID", cachedData.email.uid]]
+          : [["HEADER", "MESSAGE-ID", emailId]];
 
-      const safeResolve = (result: AttachmentData | null) => {
-        if (resolved) return;
-        resolved = true;
-        try { imap.end(); } catch (e) {}
-        resolve(result);
-      };
-
-      imap.once("ready", () => {
-        imap.openBox("INBOX", false, (err) => {
-          if (err) {
-            safeResolve(null);
+        conn.search(searchCriteria as any, (searchErr, results) => {
+          if (searchErr || !results.length) {
+            resolve(null);
             return;
           }
 
-          const searchCriteria = cachedData?.email?.uid
-            ? [["UID", cachedData.email.uid]]
-            : [["HEADER", "MESSAGE-ID", emailId]];
+          const fetch = conn.fetch(results, { bodies: "" });
 
-          imap.search(searchCriteria as any, (searchErr, results) => {
-            if (searchErr || !results.length) {
-              safeResolve(null);
-              return;
-            }
+          fetch.on("message", (msg) => {
+            let buffer = "";
 
-            const fetch = imap.fetch(results, { bodies: "" });
-
-            fetch.on("message", (msg) => {
-              let buffer = "";
-
-              msg.on("body", (stream) => {
-                stream.on("data", (chunk) => {
-                  buffer += chunk.toString("utf8");
-                });
+            msg.on("body", (stream) => {
+              stream.on("data", (chunk) => {
+                buffer += chunk.toString("utf8");
               });
+            });
 
-              msg.once("end", async () => {
-                try {
-                  const parsed = await simpleParser(buffer);
-                  const attachment = parsed.attachments?.find(
-                    (att: Attachment) => att.filename === filename ||
-                             att.filename?.toLowerCase() === filename.toLowerCase()
-                  );
+            msg.once("end", async () => {
+              try {
+                const parsed = await simpleParser(buffer);
+                const attachment = parsed.attachments?.find(
+                  (att: Attachment) => att.filename === filename ||
+                           att.filename?.toLowerCase() === filename.toLowerCase()
+                );
 
-                  if (attachment) {
-                    emailDataCache.set(emailId, {
-                      email: cachedData?.email || {} as FetchedEmail,
-                      rawAttachments: parsed.attachments,
-                      cachedAt: Date.now(),
-                    });
-
-                    safeResolve({
-                      content: attachment.content,
-                      contentType: attachment.contentType,
-                      filename: attachment.filename || filename,
-                    });
-                  } else {
-                    safeResolve(null);
-                  }
-                } catch {
-                  safeResolve(null);
+                if (attachment) {
+                  resolve({
+                    content: attachment.content,
+                    contentType: attachment.contentType,
+                    filename: attachment.filename || filename,
+                  });
+                } else {
+                  resolve(null);
                 }
-              });
+              } catch {
+                resolve(null);
+              }
             });
+          });
 
-            fetch.once("error", () => {
-              safeResolve(null);
-            });
+          fetch.once("error", () => {
+            resolve(null);
           });
         });
       });
+    });
+  } catch (err) {
+    console.error("Attachment fetch error:", err);
+    return null;
+  }
+}
 
-      imap.once("error", () => {
-        safeResolve(null);
-      });
+// IDLE support
+let persistentImap: Imap | null = null;
+let idleTimeout: NodeJS.Timeout | null = null;
+let isIdleActive = false;
+let idleNotificationTimeout: NodeJS.Timeout | null = null;
+const IDLE_DEBOUNCE_MS = 3000; // 3 seconds debounce (fast response to new emails)
+const emailUpdateCallbacks: Set<() => void> = new Set();
 
-      imap.connect();
+export function initPersistentConnection(): void {
+  if (!imapConfig.user || !imapConfig.password) {
+    console.log("Email credentials not configured");
+    return;
+  }
+
+  if (persistentImap) {
+    try { persistentImap.end(); } catch (e) {}
+  }
+
+  persistentImap = new Imap(imapConfig);
+
+  persistentImap.once("ready", () => {
+    console.log("Persistent IMAP connection established");
+    persistentImap!.openBox("INBOX", false, (err) => {
+      if (err) {
+        console.error("Error opening INBOX for IDLE:", err);
+        setTimeout(initPersistentConnection, 30000);
+        return;
+      }
+      startIdle();
     });
   });
+
+  persistentImap.on("mail", () => {
+    console.log("New email notification via IDLE");
+    // Immediately invalidate cache so next request fetches fresh
+    allEmailsCacheTime = 0;
+    // Debounce the notification callbacks
+    if (idleNotificationTimeout) clearTimeout(idleNotificationTimeout);
+    idleNotificationTimeout = setTimeout(() => {
+      clearCache();
+      notifyEmailUpdate();
+    }, IDLE_DEBOUNCE_MS);
+  });
+
+  persistentImap.on("expunge", () => {
+    console.log("Email deleted notification via IDLE");
+    // Immediately invalidate cache so next request fetches fresh
+    allEmailsCacheTime = 0;
+    // Debounce the notification callbacks
+    if (idleNotificationTimeout) clearTimeout(idleNotificationTimeout);
+    idleNotificationTimeout = setTimeout(() => {
+      clearCache();
+      notifyEmailUpdate();
+    }, IDLE_DEBOUNCE_MS);
+  });
+
+  persistentImap.once("error", (err: Error) => {
+    console.error("Persistent IMAP error:", err.message);
+    isIdleActive = false;
+    setTimeout(initPersistentConnection, 30000);
+  });
+
+  persistentImap.once("end", () => {
+    console.log("Persistent IMAP connection ended");
+    isIdleActive = false;
+    setTimeout(initPersistentConnection, 30000);
+  });
+
+  persistentImap.connect();
 }
 
-// Export queue stats for monitoring
+function startIdle(): void {
+  if (!persistentImap || isIdleActive) return;
+  isIdleActive = true;
+
+  if (idleTimeout) clearTimeout(idleTimeout);
+  idleTimeout = setTimeout(() => {
+    if (persistentImap && isIdleActive) {
+      isIdleActive = false;
+      persistentImap.openBox("INBOX", false, () => startIdle());
+    }
+  }, 25 * 60 * 1000);
+
+  console.log("IDLE mode started - listening for new emails");
+}
+
+function notifyEmailUpdate(): void {
+  emailUpdateCallbacks.forEach(cb => { try { cb(); } catch (e) {} });
+}
+
+export function onEmailUpdate(callback: () => void): () => void {
+  emailUpdateCallbacks.add(callback);
+  return () => emailUpdateCallbacks.delete(callback);
+}
+
 export function getQueueStats() {
-  return requestQueue.getStats();
+  return {
+    connectionState,
+    allEmailsCacheSize: allEmailsCache.length,
+    allEmailsCacheAge: Date.now() - allEmailsCacheTime,
+    pendingRequests: pendingRequests.size,
+  };
 }
 
-// Graceful shutdown handler
+export function setRateLimited(seconds: number): void {
+  // No-op now, handled internally
+}
+
 export function shutdown(): void {
   console.log("Shutting down email service...");
 
-  // Clear pending notifications
-  if (idleNotificationTimeout) {
-    clearTimeout(idleNotificationTimeout);
-    idleNotificationTimeout = null;
-  }
+  if (idleNotificationTimeout) clearTimeout(idleNotificationTimeout);
+  if (idleTimeout) clearTimeout(idleTimeout);
 
-  if (idleTimeout) {
-    clearTimeout(idleTimeout);
-    idleTimeout = null;
-  }
-
-  // Close persistent IMAP connection
   if (persistentImap) {
-    try {
-      persistentImap.end();
-    } catch (e) {}
+    try { persistentImap.end(); } catch (e) {}
     persistentImap = null;
   }
 
-  // Shutdown request queue
-  requestQueue.shutdown();
+  if (sharedConnection) {
+    try { sharedConnection.end(); } catch (e) {}
+    sharedConnection = null;
+  }
 
-  // Clear callbacks
+  connectionState = 'disconnected';
   emailUpdateCallbacks.clear();
+  pendingRequests.clear();
 
   console.log("Email service shutdown complete");
 }
 
-// Initialize persistent connection on module load
-initPersistentConnection();
+// Initialize connections on startup (with delay)
+setTimeout(() => {
+  getSharedConnection().catch(err => {
+    console.error("Initial connection failed:", err);
+  });
+  initPersistentConnection();
+}, 3000);

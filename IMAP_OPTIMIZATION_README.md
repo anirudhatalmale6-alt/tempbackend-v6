@@ -47,21 +47,26 @@ if (this.notifyEmailService) {
 }
 ```
 
-### 3. IDLE Notification Debouncing
+### 3. IDLE Notification with Immediate Cache Invalidation
 
 **File:** `server/email-service.ts`
 
-IDLE notifications (new email/delete events) are now debounced:
-- 2-second debounce window
-- Multiple rapid notifications are consolidated
-- Prevents burst of cache clears and fetch requests
+IDLE notifications (new email/delete events) now:
+- **Immediately invalidate cache** so next API request fetches fresh data
+- Debounce notification callbacks (3-second window) to prevent burst of WebSocket notifications
+- Result: New emails appear within seconds of arrival
 
 ```typescript
-const IDLE_DEBOUNCE_MS = 2000;
-idleNotificationTimeout = setTimeout(() => {
-  clearCache();
-  notifyEmailUpdate();
-}, IDLE_DEBOUNCE_MS);
+const IDLE_DEBOUNCE_MS = 3000;
+persistentImap.on("mail", () => {
+  // Immediately invalidate cache so next request fetches fresh
+  allEmailsCacheTime = 0;
+  // Debounce the notification callbacks
+  idleNotificationTimeout = setTimeout(() => {
+    clearCache();
+    notifyEmailUpdate();
+  }, IDLE_DEBOUNCE_MS);
+});
 ```
 
 ### 4. Enhanced IMAP Reconnection
@@ -107,11 +112,10 @@ All IMAP operations now use safe resolve/reject patterns:
 
 In `email-service.ts`:
 ```typescript
-const requestQueue = new RequestQueue(3, 5); // Max 3 concurrent, 5 req/sec
-const maxReconnectAttempts = 10;
-const baseReconnectDelay = 1000;
-const maxReconnectDelay = 60000;
-const IDLE_DEBOUNCE_MS = 2000;
+const ALL_EMAILS_CACHE_TTL = 10000;  // 10 seconds cache for all emails
+const emailCache TTL = 10000;         // 10 seconds cache for filtered results
+const IDLE_DEBOUNCE_MS = 3000;        // 3 seconds debounce for IDLE notifications
+const fetchRateLimit = 2000;          // Minimum 2 seconds between IMAP fetches
 ```
 
 In `multi-account-email-service.ts`:
