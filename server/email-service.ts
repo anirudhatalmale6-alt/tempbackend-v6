@@ -83,8 +83,8 @@ class LRUCache<K, V> {
   }
 }
 
-// Short cache TTL for fast email updates
-const emailCache = new LRUCache<string, FetchedEmail[]>(500, 5000); // 5 seconds TTL
+// Cache TTL - background fetch keeps data fresh
+const emailCache = new LRUCache<string, FetchedEmail[]>(500, 15000); // 15 seconds TTL
 const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10 minutes TTL
 
 // ============================================
@@ -93,7 +93,7 @@ const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10
 let lastFetchTime = 0;
 let allEmailsCache: FetchedEmail[] = [];
 let allEmailsCacheTime = 0;
-const ALL_EMAILS_CACHE_TTL = 5000; // 5 seconds cache
+const ALL_EMAILS_CACHE_TTL = 15000; // 15 seconds cache - background fetch keeps it fresh
 let isFetching = false;
 
 // Request coalescing
@@ -729,6 +729,7 @@ export function setRateLimited(seconds: number): void {
 export function shutdown(): void {
   console.log("Shutting down email service...");
 
+  if (backgroundFetchInterval) clearInterval(backgroundFetchInterval);
   if (idleNotificationTimeout) clearTimeout(idleNotificationTimeout);
   if (idleTimeout) clearTimeout(idleTimeout);
 
@@ -749,15 +750,34 @@ export function shutdown(): void {
   console.log("Email service shutdown complete");
 }
 
+// Background fetch loop - keeps emails fresh
+let backgroundFetchInterval: NodeJS.Timeout | null = null;
+
+function startBackgroundFetch(): void {
+  // Fetch immediately on startup
+  fetchAllEmailsOnce().catch(err => console.error("Initial fetch failed:", err));
+
+  // Then fetch every 10 seconds in background
+  backgroundFetchInterval = setInterval(() => {
+    if (!isFetching) {
+      console.log("Background fetch triggered");
+      allEmailsCacheTime = 0; // Force refresh
+      fetchAllEmailsOnce().catch(err => console.error("Background fetch failed:", err));
+    }
+  }, 10000);
+}
+
 // Initialize connections on startup (with delay)
 setTimeout(() => {
   // Start main connection first
   getMainConnection().then(() => {
-    console.log("Main connection ready, starting IDLE...");
+    console.log("Main connection ready, starting IDLE and background fetch...");
     initPersistentConnection();
+    startBackgroundFetch();
   }).catch(err => {
     console.error("Initial main connection failed:", err);
-    // Still try IDLE connection
+    // Still try IDLE connection and background fetch
     initPersistentConnection();
+    startBackgroundFetch();
   });
 }, 2000);
