@@ -2,6 +2,119 @@ import Imap from "imap";
 import { simpleParser, ParsedMail, Attachment } from "mailparser";
 import type { Email } from "@shared/schema";
 
+// ============================================
+// MULTI-ACCOUNT ROTATION FOR SPEED & SCALE
+// ============================================
+interface EmailAccount {
+  user: string;
+  password: string;
+  lastUsed: number;
+  isHealthy: boolean;
+  consecutiveFailures: number;
+}
+
+// Parse accounts from environment or use defaults
+function parseAccounts(): EmailAccount[] {
+  const accounts: EmailAccount[] = [];
+
+  // Try EMAIL_ACCOUNTS env var first (format: "email1:pass1,email2:pass2,email3:pass3")
+  const accountsEnv = process.env.EMAIL_ACCOUNTS;
+  if (accountsEnv) {
+    const pairs = accountsEnv.split(",");
+    for (const pair of pairs) {
+      const [user, password] = pair.split(":");
+      if (user && password) {
+        accounts.push({
+          user: user.trim(),
+          password: password.trim(),
+          lastUsed: 0,
+          isHealthy: true,
+          consecutiveFailures: 0,
+        });
+      }
+    }
+  }
+
+  // Fallback to single account env vars
+  if (accounts.length === 0 && process.env.EMAIL_USER && process.env.EMAIL_PASSWORD) {
+    accounts.push({
+      user: process.env.EMAIL_USER,
+      password: process.env.EMAIL_PASSWORD,
+      lastUsed: 0,
+      isHealthy: true,
+      consecutiveFailures: 0,
+    });
+  }
+
+  console.log(`Loaded ${accounts.length} email accounts for rotation`);
+  return accounts;
+}
+
+const emailAccounts = parseAccounts();
+let currentAccountIndex = 0;
+
+// Get next healthy account (round-robin with health check)
+function getNextAccount(): EmailAccount | null {
+  if (emailAccounts.length === 0) return null;
+
+  const startIndex = currentAccountIndex;
+  do {
+    const account = emailAccounts[currentAccountIndex];
+    currentAccountIndex = (currentAccountIndex + 1) % emailAccounts.length;
+
+    if (account.isHealthy) {
+      account.lastUsed = Date.now();
+      console.log(`Using account: ${account.user}`);
+      return account;
+    }
+
+    // Reset unhealthy accounts after 60 seconds
+    if (!account.isHealthy && Date.now() - account.lastUsed > 60000) {
+      account.isHealthy = true;
+      account.consecutiveFailures = 0;
+      console.log(`Recovered account: ${account.user}`);
+      account.lastUsed = Date.now();
+      return account;
+    }
+  } while (currentAccountIndex !== startIndex);
+
+  // All accounts unhealthy, try the first one anyway
+  console.log("All accounts unhealthy, trying first account");
+  emailAccounts[0].lastUsed = Date.now();
+  return emailAccounts[0];
+}
+
+// Mark account as failed
+function markAccountFailed(account: EmailAccount): void {
+  account.consecutiveFailures++;
+  if (account.consecutiveFailures >= 3) {
+    account.isHealthy = false;
+    console.log(`Account marked unhealthy: ${account.user} (${account.consecutiveFailures} failures)`);
+  }
+}
+
+// Mark account as successful
+function markAccountSuccess(account: EmailAccount): void {
+  account.consecutiveFailures = 0;
+  account.isHealthy = true;
+}
+
+// Create IMAP config for a specific account
+function createImapConfig(account: EmailAccount) {
+  return {
+    user: account.user,
+    password: account.password,
+    host: "imap.gmail.com",
+    port: 993,
+    tls: true,
+    tlsOptions: { rejectUnauthorized: false },
+    keepalive: true,
+    authTimeout: 30000,
+    connTimeout: 30000,
+  };
+}
+
+// Legacy config for backward compatibility
 const imapConfig = {
   user: process.env.EMAIL_USER || "",
   password: process.env.EMAIL_PASSWORD || "",
@@ -115,10 +228,17 @@ function getMainConnection(): Promise<Imap> {
     return mainConnectionPromise;
   }
 
-  // Create new connection
+  // Create new connection with account rotation
   mainConnectionPromise = new Promise((resolve, reject) => {
-    console.log("Creating main IMAP connection...");
-    const conn = new Imap(imapConfig);
+    const account = getNextAccount();
+    if (!account) {
+      reject(new Error("No email accounts configured"));
+      return;
+    }
+
+    console.log(`Creating main IMAP connection with ${account.user}...`);
+    const config = createImapConfig(account);
+    const conn = new Imap(config);
 
     const timeout = setTimeout(() => {
       mainConnectionPromise = null;
@@ -174,20 +294,30 @@ function getMainConnection(): Promise<Imap> {
 // For delete/attachment operations that need write access
 function createFreshConnection(): Promise<Imap> {
   return new Promise((resolve, reject) => {
-    const conn = new Imap(imapConfig);
+    const account = getNextAccount();
+    if (!account) {
+      reject(new Error("No email accounts configured"));
+      return;
+    }
+
+    const config = createImapConfig(account);
+    const conn = new Imap(config);
 
     const timeout = setTimeout(() => {
       try { conn.end(); } catch (e) {}
+      markAccountFailed(account);
       reject(new Error("Connection timeout"));
     }, 25000);
 
     conn.once("ready", () => {
       clearTimeout(timeout);
+      markAccountSuccess(account);
       resolve(conn);
     });
 
     conn.once("error", (err: Error) => {
       clearTimeout(timeout);
+      markAccountFailed(account);
       reject(err);
     });
 
@@ -636,8 +766,9 @@ const IDLE_DEBOUNCE_MS = 500; // 0.5 second debounce (instant response)
 const emailUpdateCallbacks: Set<() => void> = new Set();
 
 export function initPersistentConnection(): void {
-  if (!imapConfig.user || !imapConfig.password) {
-    console.log("Email credentials not configured");
+  const account = getNextAccount();
+  if (!account) {
+    console.log("No email accounts configured for IDLE");
     return;
   }
 
@@ -645,7 +776,9 @@ export function initPersistentConnection(): void {
     try { persistentImap.end(); } catch (e) {}
   }
 
-  persistentImap = new Imap(imapConfig);
+  console.log(`Starting IDLE connection with ${account.user}...`);
+  const config = createImapConfig(account);
+  persistentImap = new Imap(config);
 
   persistentImap.once("ready", () => {
     console.log("Persistent IMAP connection established");
@@ -731,6 +864,13 @@ export function getQueueStats() {
     globalStoreSize: globalEmailStore.size,
     allEmailsCacheAge: Date.now() - allEmailsCacheTime,
     pendingRequests: pendingRequests.size,
+    accounts: emailAccounts.map(a => ({
+      user: a.user,
+      isHealthy: a.isHealthy,
+      failures: a.consecutiveFailures,
+    })),
+    totalAccounts: emailAccounts.length,
+    healthyAccounts: emailAccounts.filter(a => a.isHealthy).length,
   };
 }
 
