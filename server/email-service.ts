@@ -84,7 +84,7 @@ class LRUCache<K, V> {
 }
 
 // Short cache TTL for fast email updates
-const emailCache = new LRUCache<string, FetchedEmail[]>(500, 10000); // 10 seconds TTL
+const emailCache = new LRUCache<string, FetchedEmail[]>(500, 5000); // 5 seconds TTL
 const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10 minutes TTL
 
 // ============================================
@@ -93,7 +93,7 @@ const emailDataCache = new LRUCache<string, CachedEmailData>(500, 600000); // 10
 let lastFetchTime = 0;
 let allEmailsCache: FetchedEmail[] = [];
 let allEmailsCacheTime = 0;
-const ALL_EMAILS_CACHE_TTL = 8000; // 8 seconds cache
+const ALL_EMAILS_CACHE_TTL = 5000; // 5 seconds cache - fast updates!
 let isFetching = false;
 
 // Request coalescing
@@ -215,8 +215,8 @@ async function fetchAllEmailsOnce(): Promise<FetchedEmail[]> {
     return fetchPromise;
   }
 
-  // Rate limit: minimum 3 seconds between fetches
-  if (now - lastFetchTime < 3000) {
+  // Rate limit: minimum 2 seconds between fetches
+  if (now - lastFetchTime < 2000) {
     console.log("Rate limiting fetch, using cache");
     return allEmailsCache.length > 0 ? allEmailsCache : Array.from(globalEmailStore.values());
   }
@@ -286,7 +286,7 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
           console.log(`Fetch timeout, got ${newEmails.length}/${expectedCount} messages`);
           finishFetch(newEmails, resolve);
         }
-      }, 15000);
+      }, 10000); // 10 second timeout
 
       console.log(`Fetching sequence ${range}`);
 
@@ -392,7 +392,7 @@ function doFetchAllEmails(conn: Imap): Promise<FetchedEmail[]> {
             clearTimeout(timeout);
             finishFetch(newEmails, resolve);
           }
-        }, 2000); // Wait 2s for parsing to complete
+        }, 1000); // Wait 1s for parsing to complete
       });
     });
   });
@@ -622,7 +622,7 @@ let persistentImap: Imap | null = null;
 let idleTimeout: NodeJS.Timeout | null = null;
 let isIdleActive = false;
 let idleNotificationTimeout: NodeJS.Timeout | null = null;
-const IDLE_DEBOUNCE_MS = 3000; // 3 seconds debounce (fast response to new emails)
+const IDLE_DEBOUNCE_MS = 1000; // 1 second debounce (very fast response)
 const emailUpdateCallbacks: Set<() => void> = new Set();
 
 export function initPersistentConnection(): void {
